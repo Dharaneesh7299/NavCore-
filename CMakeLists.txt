@@ -20,6 +20,7 @@ target_include_directories(eigen INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_par
 
 add_library(navcore STATIC
   src/align/hacf_aligner.cpp
+  src/align/mag_calibrator.cpp
 )
 target_include_directories(navcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(navcore PUBLIC eigen)
@@ -43,6 +44,7 @@ if(NAVCORE_BUILD_TESTS)
 
   add_executable(navcore_unit_tests
     tests/unit/hacf_aligner_test.cpp
+    tests/unit/mag_calibrator_test.cpp
   )
   target_link_libraries(navcore_unit_tests PRIVATE navcore gtest_main)
 

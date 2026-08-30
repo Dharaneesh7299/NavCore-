@@ -210,6 +210,38 @@ TEST(HacfAligner, SteadyCruiseNeverConverges) {
   EXPECT_LT(std::fabs(AngleDiffDeg(final_state.roll_deg, kTrueRoll)), 2.0f);
 }
 
+// The exact gap the class's own doc comment (has_bearing_anchor) flags as unsolved by
+// the GNSS-bearing bridge alone: a straight-line drive that never calls addGnssBearing
+// at all, with a true yaw OUTSIDE the canonical [-90,90) half-turn range PCA collapses
+// to — so recovering the actual value (not its 180deg-flipped mirror) requires
+// yaw_branch_deg to be set correctly, and nothing but brake/throttle asymmetry is
+// available to do it here.
+TEST(HacfAligner, BrakeThrottleAsymmetryResolvesSignWithNoGnss) {
+  constexpr float kPitch = 6.0f;
+  constexpr float kRoll = 2.0f;
+  constexpr float kTrueYaw = 150.0f;  // outside [-90,90) - canonical alone would give -30deg
+  constexpr int64_t kT0 = 0;
+
+  // Accelerate gently (throttle), brake hard (brake) - realistic asymmetry, clearing
+  // both kBrakeThrottleMinExtremeMps2 and kBrakeThrottleAsymmetryFactor with margin.
+  const std::vector<DrivePhase> phases = {
+      {2.0, 0.0f}, {3.0, 2.0f}, {2.0, 0.0f}, {2.0, -3.5f}, {3.0, 0.0f}, {3.0, 2.0f}, {2.0, -3.5f}, {3.0, 0.0f},
+  };
+
+  std::mt19937 rng(123);
+  const auto samples = GenerateDrive(kPitch, kRoll, kTrueYaw, phases, kT0, rng);
+
+  navcore::HacfAligner aligner;
+  // No addGnssBearing calls at all - the point of this test.
+  for (const auto& s : samples) aligner.addImuSample(s);
+
+  const navcore::AlignState final_state = aligner.state();
+  EXPECT_TRUE(final_state.converged);
+  EXPECT_LT(std::fabs(AngleDiffDeg(final_state.yaw_deg, kTrueYaw)), 2.0f)
+      << "yaw=" << final_state.yaw_deg << ", expected ~" << kTrueYaw
+      << " (a wrong sign would land near " << AngleDiffDeg(kTrueYaw, 180.0f) << " instead)";
+}
+
 TEST(HacfAligner, ReconvergesAfterShockAndSustainedYawChange) {
   constexpr float kPitch = 8.0f;
   constexpr float kRoll = 3.0f;

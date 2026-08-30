@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <memory>
 
 namespace navcore {
@@ -37,6 +38,16 @@ constexpr float kShockGyroThresholdRadS = 3.0f;   // sudden spike, not ordinary 
 constexpr float kReAlignDisagreementDeg = 5.0f;
 constexpr int kReAlignPersistWindows = 2;         // disagreement must persist, not be a single blip
 constexpr float kBearingSignFlipThresholdDeg = 90.0f;
+
+// Brake/throttle sign disambiguation (see solvePcaWindow()'s own use of these). An
+// extreme has to clear this magnitude to count as a real event at all — well above the
+// kDynamicAccelThresholdMps2 noise floor that just gates buffer entry, since a routine
+// small fluctuation shouldn't be mistaken for a genuine accel/brake spike.
+constexpr float kBrakeThrottleMinExtremeMps2 = 1.5f;
+// Ordinary vehicles brake harder than they accelerate — the larger-magnitude extreme in
+// a window has to exceed the other by at least this ratio before it's trusted as "that
+// one's the brake event," not just ordinary variation between two roughly-equal events.
+constexpr float kBrakeThrottleAsymmetryFactor = 1.3f;
 
 float wrapDeg180(float deg) {
   float d = std::fmod(deg + 180.0f, 360.0f);
@@ -180,18 +191,24 @@ struct HacfAligner::Impl {
   // trusts the current branch as-is; only a later bearing that disagrees with the
   // gyro-projected prediction flips it.
   //
-  // KNOWN LIMITATION, worth being explicit about: on a perfectly straight-line drive
-  // (no turning at all), gyro_yaw_integral_deg barely changes, so every bearing sample
+  // LIMITATION, worth being explicit about: on a perfectly straight-line drive (no
+  // turning at all), gyro_yaw_integral_deg barely changes, so every bearing sample
   // agrees with the projected prediction *regardless of whether the branch is actually
   // right* — there is nothing to disagree with. This bridge can only detect and correct
   // a wrong branch once some real heading change (an actual turn) happens somewhere
   // during the drive to calibrate against; it cannot validate the very first guess on
-  // its own. That first guess is a coin flip resolved only by whichever raw sign PCA's
-  // eigensolver happens to return — tested and confirmed real: a synthetic straight-line
-  // drive whose true yaw falls outside the canonical [-90, 90) range (see
-  // solvePcaWindow()) converges confidently to the WRONG 180deg-flipped value with this
-  // mechanism alone. Solving this properly needs either a magnetometer (deliberately out
-  // of scope here) or a real turn during the drive; it's a genuine gap, not an oversight.
+  // its own from bearing+gyro alone.
+  //
+  // solvePcaWindow() now covers the straight-line case this bridge can't: brake/throttle
+  // asymmetry picks yaw_branch_deg from accel/brake event magnitudes whenever
+  // has_bearing_anchor is still false, deferring to this GNSS bridge the moment it has
+  // anything to say. That's a real fix for the common case (a drive with at least one
+  // clearly-asymmetric accel/brake pair before GNSS ever weighs in — see
+  // BrakeThrottleAsymmetryResolvesSignWithNoGnss), not a complete one: a drive with no
+  // clear accel/brake asymmetry AND no turn AND no GNSS bearing before the first solve is
+  // still a coin flip on PCA's raw eigensolver sign. A magnetometer (NavCore's
+  // MagCalibrator exists now, but is deliberately standalone from this class — see its
+  // own doc comment for why) could close that residual gap if it's ever wired in here.
   float gyro_yaw_integral_deg = 0.0f;
   bool has_bearing_anchor = false;
   float bearing_anchor_deg = 0.0f;
@@ -357,6 +374,49 @@ struct HacfAligner::Impl {
     const Eigen::Vector2f principal = solver.eigenvectors().col(1);
     const float raw_yaw_deg = std::atan2(principal.y(), principal.x()) * kRad2Deg;
     const float canonical_deg = wrapHalfTurnDeg(raw_yaw_deg);
+
+    // Brake/throttle asymmetry: a second, independent way to pick yaw_branch_deg,
+    // alongside the GNSS-bearing bridge above. Exists specifically for the gap that
+    // bridge cannot cover on its own (see has_bearing_anchor's own doc comment): a
+    // straight-line drive with no GNSS bearing yet gives it nothing to disagree with,
+    // so the very first branch choice would otherwise be a coin flip on whichever raw
+    // sign PCA's eigensolver happened to return. Deliberately deferred to the GNSS
+    // bridge the instant it has anything to say (has_bearing_anchor) — that mechanism
+    // is corrected by a real observed turn, which is strictly more reliable than a
+    // magnitude heuristic, so this never re-litigates a branch GNSS has already spoken
+    // on.
+    if (!has_bearing_anchor) {
+      const float canonical_rad = canonical_deg * kDeg2Rad;
+      const Eigen::Vector2f axis(std::cos(canonical_rad), std::sin(canonical_rad));
+      float max_proj = -std::numeric_limits<float>::infinity();
+      float min_proj = std::numeric_limits<float>::infinity();
+      for (const auto& d : dyn_buffer) {
+        const float proj = d.x * axis.x() + d.y * axis.y();
+        max_proj = std::max(max_proj, proj);
+        min_proj = std::min(min_proj, proj);
+      }
+      // Only draw a conclusion when the window shows real evidence of BOTH a
+      // throttle-like and a brake-like event — a window dominated by only one kind of
+      // event has an absent opposite extreme, not a small one, and concluding
+      // anything from that would be exactly the per-window guessing this class's own
+      // design already rejected once (see the comment above solvePcaWindow's PCA
+      // solve).
+      const float brakeMag = -min_proj;
+      if (max_proj > kBrakeThrottleMinExtremeMps2 && brakeMag > kBrakeThrottleMinExtremeMps2) {
+        if (brakeMag > max_proj * kBrakeThrottleAsymmetryFactor) {
+          // The negative extreme is the dominant one -> it's the brake event -> the
+          // canonical (+axis) direction really is forward.
+          yaw_branch_deg = 0.0f;
+        } else if (max_proj > brakeMag * kBrakeThrottleAsymmetryFactor) {
+          // The positive extreme dominates instead -> IT's actually the brake event ->
+          // true forward is the opposite of canonical.
+          yaw_branch_deg = 180.0f;
+        }
+        // else: too close to call apart from noise this window — leave yaw_branch_deg
+        // exactly as it was rather than guess.
+      }
+    }
+
     const float candidate_deg = wrapDeg180(canonical_deg + yaw_branch_deg);
 
     if (converged) {
